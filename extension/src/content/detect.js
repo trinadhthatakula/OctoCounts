@@ -181,13 +181,47 @@ function resolveRefFromPage(treePath, payloadRefs, buttonRef, metaRef) {
       ref => treePath === ref || treePath.startsWith(`${ref}/`)
     );
     if (fromPath) return fromPath;
-    // The page disagrees with the URL — mid-navigation, or a payload shape this
-    // code no longer understands. The default branch is not what is on screen,
-    // so claiming it would be worse than saying nothing.
+
+    const expanded = expandedShaFor(treePath, candidates);
+    if (expanded) return expanded;
+
+    // The page disagrees with the URL — mid-navigation, so the payload still
+    // names the previous page's ref, or a payload shape this code no longer
+    // understands.
+    //
+    // This is the one answer here that is a guess rather than a reading: `''`
+    // means the default branch (see `parseRepoInfo`), which is wrong whenever
+    // the URL names something else. Returning a contradicted payload ref would
+    // be wrong in the same way and additionally unstable — it changes with
+    // navigation timing — so the guess at least matches what the repo-home card
+    // shows for the same repository. Resolving it properly needs the ref list,
+    // which a content script does not have.
     return '';
   }
 
   return candidates[0] || metaRef;
+}
+
+const ABBREVIATED_SHA = /^[0-9a-f]{7,39}$/;
+const FULL_SHA = /^[0-9a-f]{40}$/;
+
+/**
+ * `/tree/ea91b33` is a real URL shape, but GitHub expands the abbreviation in
+ * the payload, so the page states `ea91b33ca57f…` — which neither equals the
+ * path nor prefixes it with a `/`. Before this, that page resolved to `''` and
+ * the card silently reported the *default branch's* count for a URL pinned to a
+ * commit.
+ *
+ * The reverse test has to stay scoped to that one shape: a bare
+ * `candidate.startsWith(treePath)` would resolve `/tree/main` to a branch named
+ * `main-v2`. Only a hex abbreviation expanding to a full SHA qualifies, and the
+ * expansion is what gets returned — it is unambiguous, and it keeps the cache
+ * key distinct from the default-branch entry for the same repository.
+ */
+function expandedShaFor(treePath, candidates) {
+  const first = treePath.split('/')[0];
+  if (!ABBREVIATED_SHA.test(first)) return '';
+  return candidates.find(ref => FULL_SHA.test(ref) && ref.startsWith(first)) || '';
 }
 
 // The skipForks setting fails silently when this returns a wrong answer, so the

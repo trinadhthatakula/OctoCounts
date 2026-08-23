@@ -344,6 +344,38 @@ test('the ref is found under a route wrapper this code has never seen', () => {
   assert.equal(parseRepoInfo('/octo/demo/tree/develop', document).ref, 'develop');
 });
 
+test('an abbreviated SHA in the URL resolves to the full SHA the page states', () => {
+  const sha = 'ea91b33ca57ff0581b38e735cc108f831bccbdaa';
+  const document = pageWithPayload({
+    codeViewLayoutRoute: { refInfo: { name: sha } },
+  });
+  // GitHub expands the abbreviation in the payload, so neither the equality nor
+  // the `<ref>/` prefix test matches. This resolved to `''` before, which the
+  // API reads as "default branch" — so a page pinned to a commit silently
+  // reported the default branch's count.
+  assert.equal(parseRepoInfo('/tokio-rs/tokio/tree/ea91b33', document).ref, sha);
+  assert.equal(parseRepoInfo('/tokio-rs/tokio/tree/ea91b33/tokio', document).ref, sha);
+  // The full SHA still works through the ordinary path.
+  assert.equal(parseRepoInfo(`/tokio-rs/tokio/tree/${sha}`, document).ref, sha);
+});
+
+test('the SHA expansion cannot resolve a branch name to a similar branch name', () => {
+  // The guard that makes the check above safe: matching a candidate that merely
+  // *starts with* the path would resolve `/tree/main` to `main-v2`. Only a hex
+  // abbreviation expanding to a full SHA qualifies.
+  const nearMiss = pageWithPayload({
+    codeViewLayoutRoute: { refInfo: { name: 'main-v2' } },
+  });
+  assert.equal(parseRepoInfo('/octo/demo/tree/main', nearMiss).ref, '');
+
+  // `deadbee` is hex and abbreviation-shaped, but a 7-char candidate is a
+  // branch name, not an expansion of one.
+  const shortCandidate = pageWithPayload({
+    codeViewLayoutRoute: { refInfo: { name: 'deadbeef' } },
+  });
+  assert.equal(parseRepoInfo('/octo/demo/tree/deadbee', shortCandidate).ref, '');
+});
+
 test('a repo home with no payload falls back to the default-branch meta tag', () => {
   const { document } = parseHTML(`
     <html><head>

@@ -58,8 +58,20 @@ pub enum GitHubError {
     RateLimited,
     #[error("repository archive is too large")]
     TooLarge,
+    /// Carries the repository's real default branch when the resolver knew it.
+    /// Both resolution paths have it in hand at exactly the moment they decide
+    /// the requested ref is unresolvable — GraphQL because `REF_QUERY` always
+    /// selects `defaultBranchRef`, REST because the repo call precedes the
+    /// commit call — and dropping it is what makes a `main`-vs-`master`
+    /// mismatch undiagnosable from the client side.
     #[error("requested ref was not found")]
-    RefNotFound,
+    RefNotFound { default_branch: Option<String> },
+    /// Distinct from [`GitHubError::RefNotFound`]: the caller asked for no ref
+    /// at all and there is no default branch to fall back to. Reporting that as
+    /// "requested ref was not found" tells a user their ref is missing when
+    /// they never supplied one.
+    #[error("repository is empty and has no default branch")]
+    EmptyRepository,
     /// GitHub/GitLab itself is failing (5xx or timeouts that survive retries).
     /// Distinct from [`GitHubError::Request`] so clients can tell an upstream
     /// outage apart from a bug in this service.
@@ -104,6 +116,13 @@ pub struct GitHubClient {
 
 #[derive(Debug, Deserialize)]
 struct RepoResponse {
+    /// Defensive only. GitHub's `full-repository` schema makes this required and
+    /// it is present even for a repository with no commits — an empty repo
+    /// reports the branch the setting names, which is why the commits endpoint's
+    /// 409 is what identifies that state and not a missing field here. Kept so a
+    /// schema change cannot fail the whole deserialization; the empty string is
+    /// then filtered out at the one call site.
+    #[serde(default)]
     default_branch: String,
     html_url: String,
     private: bool,
@@ -120,11 +139,29 @@ struct CommitResponse {
 struct GitLabProjectResponse {
     id: u64,
     path_with_namespace: String,
-    default_branch: String,
+    /// Missing whenever the caller cannot read the code: GitLab exposes
+    /// `default_branch` (alongside the clone URLs) only to callers holding
+    /// `read_code`, which a *public* project denies when its repository feature
+    /// is member-only or disabled. A project with no commits is a different
+    /// state and says so with `empty_repo`, so this being absent is not
+    /// evidence of emptiness — see the one call site, which answers
+    /// "not readable" rather than "empty". `Option` also keeps a schema change
+    /// on a field this resolver barely needs from failing the whole response.
+    #[serde(default)]
+    default_branch: Option<String>,
     web_url: String,
     visibility: String,
     #[serde(default)]
     star_count: Option<u64>,
+    /// GitLab states emptiness outright, where the GitHub path has to read it
+    /// off a 409 from the commits endpoint. Defaulting to `false` fails towards
+    /// "has commits", which is the safe direction: the worst outcome is a ref
+    /// lookup that fails on its own terms. If GitLab gates this on `read_code`
+    /// as well, an empty *and* unreadable project falls through to the
+    /// not-readable answer below — indistinguishable from here, and no more
+    /// wrong than the alternative.
+    #[serde(default)]
+    empty_repo: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -208,12 +245,16 @@ enum GraphQlOutcome {
 /// The subset of [`GitHubError`] a GraphQL response can decide on its own.
 /// Separate because `GitHubError` is not `PartialEq` (it wraps `reqwest::Error`)
 /// and these outcomes need to be asserted on directly.
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+///
+/// Not `Copy`: `RefNotFound` carries the default branch so the API error can
+/// name it.
+#[derive(Debug, PartialEq, Eq, Clone)]
 enum GraphQlFailure {
     NotFound,
     PrivateRepo,
     RateLimited,
-    RefNotFound,
+    RefNotFound { default_branch: Option<String> },
+    EmptyRepository,
 }
 
 impl From<GraphQlFailure> for GitHubError {
@@ -222,7 +263,10 @@ impl From<GraphQlFailure> for GitHubError {
             GraphQlFailure::NotFound => GitHubError::NotFound,
             GraphQlFailure::PrivateRepo => GitHubError::PrivateRepo,
             GraphQlFailure::RateLimited => GitHubError::RateLimited,
-            GraphQlFailure::RefNotFound => GitHubError::RefNotFound,
+            GraphQlFailure::RefNotFound { default_branch } => {
+                GitHubError::RefNotFound { default_branch }
+            }
+            GraphQlFailure::EmptyRepository => GitHubError::EmptyRepository,
         }
     }
 }
@@ -238,10 +282,29 @@ fn interpret_graphql(response: GraphQlResponse, requested_ref: Option<&str>) -> 
         return GraphQlOutcome::Failed(GraphQlFailure::PrivateRepo);
     }
 
+    let default_branch = repository
+        .default_branch_ref
+        .as_ref()
+        .map(|branch| branch.name.clone())
+        .filter(|name| !name.is_empty());
+
     match requested_ref {
         Some(ref_name) => {
             let Some(object) = repository.object else {
-                return GraphQlOutcome::Failed(GraphQlFailure::RefNotFound);
+                // No default branch and nothing resolved means the repository
+                // has no commits, so the ref was never the problem. REST reaches
+                // this from a 409 on the commits endpoint; without this arm the
+                // two paths returned different error bodies for the same
+                // request, which the parity invariant forbids.
+                //
+                // A repository whose HEAD points at a deleted branch while other
+                // branches still have commits would be misreported here, but
+                // GitHub does not produce that state on its own and the previous
+                // answer for it — a bare `ref_not_found` — was no better.
+                if default_branch.is_none() {
+                    return GraphQlOutcome::Failed(GraphQlFailure::EmptyRepository);
+                }
+                return GraphQlOutcome::Failed(GraphQlFailure::RefNotFound { default_branch });
             };
             // GitHub resolves annotated tags to their commit, so anything else
             // is a shape this code has not seen; let REST answer it.
@@ -256,22 +319,21 @@ fn interpret_graphql(response: GraphQlResponse, requested_ref: Option<&str>) -> 
             }
         }
         None => {
-            // An empty repository has no default branch; REST answers that with
-            // a 404 from the commits endpoint, which maps to the same error.
+            // An empty repository has no default branch. REST reaches the same
+            // conclusion from the commits endpoint — a 409 for the repository,
+            // or a 404 on the branch `/repos` named — and both now report it as
+            // `EmptyRepository` rather than blaming a ref the caller never
+            // supplied.
             let Some(target) = repository
                 .default_branch_ref
                 .as_ref()
                 .and_then(|branch| branch.target.as_ref())
             else {
-                return GraphQlOutcome::Failed(GraphQlFailure::RefNotFound);
+                return GraphQlOutcome::Failed(GraphQlFailure::EmptyRepository);
             };
             GraphQlOutcome::Resolved {
                 html_url: repository.url.clone(),
-                ref_name: repository
-                    .default_branch_ref
-                    .as_ref()
-                    .map(|branch| branch.name.clone())
-                    .unwrap_or_default(),
+                ref_name: default_branch.unwrap_or_default(),
                 stars: repository.stargazer_count,
                 commit_sha: target.oid.clone(),
             }
@@ -327,6 +389,57 @@ struct RepoTarget {
     owner: String,
     repo: String,
     path: String,
+    /// Ref candidates read out of the pasted URL's trailing path
+    /// (`/tree/<ref>`, `/blob/<ref>/<file>`, `/commit/<sha>`), best first.
+    ///
+    /// Only ever consulted when the caller supplied no explicit `refName`, and
+    /// a candidate that does not resolve is skipped rather than fatal — see
+    /// [`GitHubClient::resolve_github_ref`].
+    url_ref_candidates: Vec<String>,
+}
+
+/// Path segments that introduce a ref in a github.com URL. `commits` (plural)
+/// is the history view, `commit` (singular) a single commit; both are followed
+/// by a ref.
+const GITHUB_REF_MARKERS: [&str; 4] = ["tree", "blob", "commit", "commits"];
+
+/// Turns the segments after a ref marker into resolution candidates.
+///
+/// `/tree/<ref>/<path>` is genuinely ambiguous: `main/src` is either branch
+/// `main` plus directory `src`, or a branch literally named `main/src` (git
+/// allows slashes, and `release/1.x` is a common shape). Nothing in the URL
+/// distinguishes them — GitHub's own web UI resolves it server-side against the
+/// real ref list, which is why `extension/src/content/detect.js` reads the ref
+/// from the page instead of the path.
+///
+/// So both readings are offered, longest first: the whole remainder, then its
+/// first segment. That covers a slashed ref with no subpath and a simple ref
+/// with a subpath — the two shapes that actually occur. A slashed ref *and* a
+/// subpath resolves to neither and falls through to the default branch, which
+/// is what this code did for every one of these URLs before.
+fn ref_candidates_from_path(rest: &[String]) -> Vec<String> {
+    if rest.is_empty() {
+        return Vec::new();
+    }
+    // `Url::path_segments` yields percent-encoded segments, but a ref name
+    // travels onward as data that `resolve_commit` encodes again. Leaving the
+    // escapes in place turned `release%2020.1` into `release%252020.1`, which
+    // GitHub answers with a 404. A bare `%` is not an error here: `100%` is a
+    // legal branch name, so a segment that does not decode is kept verbatim.
+    let decoded: Vec<String> = rest
+        .iter()
+        .map(|part| match urlencoding::decode(part) {
+            Ok(value) => value.into_owned(),
+            Err(_) => part.clone(),
+        })
+        .collect();
+    let whole = decoded.join("/");
+    let first = decoded[0].clone();
+    if first == whole {
+        vec![whole]
+    } else {
+        vec![whole, first]
+    }
 }
 
 fn build_ref_cache(ttl: Duration) -> Cache<(String, Option<String>), RepoRef> {
@@ -566,11 +679,22 @@ impl GitHubClient {
                 if owner.is_empty() || repo.is_empty() {
                     return Err(GitHubError::InvalidUrl);
                 }
+                // A pasted browse URL already says which ref the user is looking
+                // at. Segments past the marker used to be discarded, so
+                // `/tree/master` silently analysed the default branch — harmless
+                // when that is `main`, wrong for every repo where it is not.
+                let url_ref_candidates = match segments.get(2) {
+                    Some(marker) if GITHUB_REF_MARKERS.contains(&marker.as_str()) => {
+                        ref_candidates_from_path(&segments[3..])
+                    }
+                    _ => Vec::new(),
+                };
                 Ok(RepoTarget {
                     provider: RepositoryProvider::GitHub,
                     path: format!("{owner}/{repo}"),
                     owner,
                     repo,
+                    url_ref_candidates,
                 })
             }
             "gitlab.com" => {
@@ -585,6 +709,10 @@ impl GitHubClient {
                     owner,
                     repo,
                     path,
+                    // GitLab browse URLs put the ref behind a `/-/` separator that
+                    // this parser does not split on yet, so there is nothing
+                    // trustworthy to extract here.
+                    url_ref_candidates: Vec::new(),
                 })
             }
             _ => Err(GitHubError::InvalidUrl),
@@ -631,15 +759,62 @@ impl GitHubClient {
         }
     }
 
+    /// GitHub ref resolution, with the pasted URL's own ref as a fallback source.
+    ///
+    /// An explicit `requested_ref` is authoritative and resolved exactly once: a
+    /// caller who names a ref that does not exist should be told so, not quietly
+    /// given a different one. Only when no ref was supplied are the URL-derived
+    /// candidates tried, and a candidate that turns out not to be a ref is
+    /// skipped rather than fatal — the last resort is still the default branch,
+    /// which is what every browse URL resolved to before, so no URL that used to
+    /// work can start failing.
     async fn resolve_github_ref(
         &self,
         target: RepoTarget,
         requested_ref: Option<String>,
         cache_key: (String, Option<String>),
     ) -> Result<RepoRef, GitHubError> {
-        let owner = target.owner;
-        let repo = target.repo;
         let requested_ref = requested_ref.filter(|value| !value.trim().is_empty());
+        if requested_ref.is_some() || target.url_ref_candidates.is_empty() {
+            return self
+                .resolve_github_ref_exact(&target.owner, &target.repo, requested_ref, cache_key)
+                .await;
+        }
+
+        for candidate in &target.url_ref_candidates {
+            match self
+                .resolve_github_ref_exact(
+                    &target.owner,
+                    &target.repo,
+                    Some(candidate.clone()),
+                    cache_key.clone(),
+                )
+                .await
+            {
+                // Only "that is not a ref" means try the next reading of the
+                // path. Every other error is about the repository itself and
+                // would come back identically from the remaining attempts.
+                Err(GitHubError::RefNotFound { .. }) => continue,
+                other => return other,
+            }
+        }
+
+        self.resolve_github_ref_exact(&target.owner, &target.repo, None, cache_key)
+            .await
+    }
+
+    /// Resolves one ref, or the default branch when `requested_ref` is `None`.
+    /// The GraphQL fast path answers in a single request; REST needs two and is
+    /// also the fallback whenever GraphQL cannot give a definitive answer.
+    async fn resolve_github_ref_exact(
+        &self,
+        owner: &str,
+        repo: &str,
+        requested_ref: Option<String>,
+        cache_key: (String, Option<String>),
+    ) -> Result<RepoRef, GitHubError> {
+        let owner = owner.to_owned();
+        let repo = repo.to_owned();
 
         if self.has_token {
             match self
@@ -691,9 +866,31 @@ impl GitHubClient {
             return Err(GitHubError::PrivateRepo);
         }
 
-        let ref_name = requested_ref.unwrap_or_else(|| repo_body.default_branch.clone());
+        let default_branch = Some(repo_body.default_branch.clone()).filter(|name| !name.is_empty());
+        let used_default = requested_ref.is_none();
+        let ref_name = match requested_ref {
+            Some(value) => value,
+            // Mirrors the GraphQL path: with no ref requested and no default
+            // branch to fall back to, the repository is empty. Reporting that as
+            // a missing ref is what sends people looking for a ref field to fix.
+            None => default_branch.clone().ok_or(GitHubError::EmptyRepository)?,
+        };
 
-        let commit_sha = self.resolve_commit(&owner, &repo, &ref_name).await?;
+        let commit_sha = match self.resolve_commit(&owner, &repo, &ref_name).await {
+            Ok(sha) => sha,
+            // A 404 on the branch the repo call just named as the default means
+            // the branch exists as a setting but has no commits.
+            Err(GitHubError::RefNotFound { .. }) if used_default => {
+                return Err(GitHubError::EmptyRepository)
+            }
+            // `resolve_commit` cannot know the default branch; this call site
+            // does, and attaching it here is what lets the API name the branch
+            // the caller probably wanted.
+            Err(GitHubError::RefNotFound { .. }) => {
+                return Err(GitHubError::RefNotFound { default_branch })
+            }
+            Err(other) => return Err(other),
+        };
 
         let repo_ref = RepoRef {
             provider: RepositoryProvider::GitHub,
@@ -784,12 +981,41 @@ impl GitHubClient {
             return Err(GitHubError::PrivateRepo);
         }
 
-        let ref_name = requested_ref
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| project_body.default_branch.clone());
-        let commit_sha = self
-            .resolve_gitlab_commit(project_body.id, &ref_name)
-            .await?;
+        let requested_ref = requested_ref.filter(|value| !value.trim().is_empty());
+        let used_default = requested_ref.is_none();
+        let default_branch = project_body
+            .default_branch
+            .clone()
+            .filter(|name| !name.trim().is_empty());
+        let ref_name = match requested_ref {
+            Some(value) => value,
+            // Nothing to analyse and nothing to suggest. Mirrors the GitHub
+            // path, which reaches the same conclusion without `empty_repo`.
+            None if project_body.empty_repo => return Err(GitHubError::EmptyRepository),
+            // No branch to fall back to on a project that claims to have
+            // commits: GitLab withheld the field because we lack `read_code`,
+            // so the archive endpoint would refuse us too. `empty_repository`
+            // used to be the answer here, which told the user their repository
+            // has no commits — confidently false about a repository whose code
+            // is merely hidden. Only this arm checks it: a caller that named
+            // its own ref needs no default branch, and a schema change that
+            // drops the field must not be able to reject that request.
+            None => default_branch.clone().ok_or(GitHubError::PrivateRepo)?,
+        };
+        let commit_sha = match self.resolve_gitlab_commit(project_body.id, &ref_name).await {
+            Ok(sha) => sha,
+            // The default branch itself has no commits, so the ref was never
+            // the problem.
+            Err(GitHubError::RefNotFound { .. }) if used_default => {
+                return Err(GitHubError::EmptyRepository)
+            }
+            // Same reason as the GitHub path: the project request already told
+            // us the default branch, so the 404 can name it.
+            Err(GitHubError::RefNotFound { .. }) => {
+                return Err(GitHubError::RefNotFound { default_branch })
+            }
+            Err(other) => return Err(other),
+        };
         let owner = project_body
             .path_with_namespace
             .rsplit_once('/')
@@ -808,6 +1034,8 @@ impl GitHubClient {
         Ok(repo_ref)
     }
 
+    /// Returns `RefNotFound` with no default branch: this call does not know it.
+    /// The caller has it from the preceding repository request and attaches it.
     async fn resolve_commit(
         &self,
         owner: &str,
@@ -827,9 +1055,20 @@ impl GitHubClient {
                 Ok(body.sha)
             }
             StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS => Err(GitHubError::RateLimited),
-            StatusCode::NOT_FOUND => Err(GitHubError::RefNotFound),
+            StatusCode::NOT_FOUND => Err(GitHubError::RefNotFound {
+                default_branch: None,
+            }),
+            // "Git Repository is empty." GitHub answers this endpoint with a 409
+            // for a repository with no commits, whatever ref was asked for. It
+            // used to fall into the catch-all below and be reported as a missing
+            // ref alongside the default branch from `/repos` — a branch that has
+            // no commits either. GraphQL calls the same state `EmptyRepository`,
+            // and the two paths have to agree.
+            StatusCode::CONFLICT => Err(GitHubError::EmptyRepository),
             status if status.is_server_error() => Err(GitHubError::UpstreamUnavailable),
-            _ => Err(GitHubError::RefNotFound),
+            _ => Err(GitHubError::RefNotFound {
+                default_branch: None,
+            }),
         }
     }
 
@@ -849,9 +1088,13 @@ impl GitHubClient {
                 Ok(body.id)
             }
             StatusCode::FORBIDDEN | StatusCode::TOO_MANY_REQUESTS => Err(GitHubError::RateLimited),
-            StatusCode::NOT_FOUND => Err(GitHubError::RefNotFound),
+            StatusCode::NOT_FOUND => Err(GitHubError::RefNotFound {
+                default_branch: None,
+            }),
             status if status.is_server_error() => Err(GitHubError::UpstreamUnavailable),
-            _ => Err(GitHubError::RefNotFound),
+            _ => Err(GitHubError::RefNotFound {
+                default_branch: None,
+            }),
         }
     }
 
@@ -939,8 +1182,8 @@ impl GitHubClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_ref_cache, interpret_graphql, GitHubClient, GraphQlFailure, GraphQlOutcome, RepoRef,
-        RepositoryProvider, REF_CACHE_TTL,
+        build_ref_cache, interpret_graphql, GitHubClient, GitHubError, GitLabProjectResponse,
+        GraphQlFailure, GraphQlOutcome, RepoRef, RepositoryProvider, REF_CACHE_TTL,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
@@ -1240,24 +1483,32 @@ mod tests {
     }
 
     /// A ref that resolves to nothing comes back as a present repository with a
-    /// null object.
+    /// null object. The failure must carry the repository's real default branch:
+    /// that is the only thing that tells a caller who asked for `main` on a
+    /// `master` repository what to ask for instead.
     #[test]
     fn graphql_maps_an_unresolvable_ref_to_ref_not_found() {
         let outcome = interpret(
             r#"{"data":{"repository":{
                 "isPrivate":false,
                 "url":"https://github.com/tokio-rs/axum",
-                "defaultBranchRef":{"name":"main","target":{"oid":"a511"}},
+                "defaultBranchRef":{"name":"master","target":{"oid":"a511"}},
                 "object":null
             }}}"#,
             Some("does-not-exist-ref"),
         );
-        assert_eq!(outcome, GraphQlOutcome::Failed(GraphQlFailure::RefNotFound));
+        assert_eq!(
+            outcome,
+            GraphQlOutcome::Failed(GraphQlFailure::RefNotFound {
+                default_branch: Some("master".to_string()),
+            })
+        );
     }
 
-    /// An empty repository has no default branch to resolve.
+    /// An empty repository has no default branch to resolve — and no ref was
+    /// requested, so it must not be reported as a missing ref.
     #[test]
-    fn graphql_maps_an_empty_repository_to_ref_not_found() {
+    fn graphql_maps_an_empty_repository_to_empty_repository() {
         let outcome = interpret(
             r#"{"data":{"repository":{
                 "isPrivate":false,
@@ -1266,7 +1517,32 @@ mod tests {
             }}}"#,
             None,
         );
-        assert_eq!(outcome, GraphQlOutcome::Failed(GraphQlFailure::RefNotFound));
+        assert_eq!(
+            outcome,
+            GraphQlOutcome::Failed(GraphQlFailure::EmptyRepository)
+        );
+    }
+
+    /// A requested ref that resolves to nothing in a repository that also has no
+    /// default branch is the empty-repository case, not a missing ref: there is
+    /// no ref the caller could have asked for instead. This used to answer
+    /// `ref_not_found` with no branch to suggest, which REST — reading a 409
+    /// off the commits endpoint — contradicted for the same request.
+    #[test]
+    fn graphql_reports_an_empty_repository_even_when_a_ref_was_requested() {
+        let outcome = interpret(
+            r#"{"data":{"repository":{
+                "isPrivate":false,
+                "url":"https://github.com/acme/empty",
+                "defaultBranchRef":null,
+                "object":null
+            }}}"#,
+            Some("master"),
+        );
+        assert_eq!(
+            outcome,
+            GraphQlOutcome::Failed(GraphQlFailure::EmptyRepository)
+        );
     }
 
     /// The safety valve. An object type this code does not understand, or an
@@ -1350,6 +1626,15 @@ mod tests {
             ),
             // renamed repository, resolved under its old name
             ("https://github.com/vuejs/vue-next", None),
+            // default branch that is not `main` — the case the service used to
+            // fail on, and the one both paths must agree is `master`
+            ("https://github.com/trinadhthatakula/Thor", None),
+            // the same repository as a pasted browse URL: the ref comes out of
+            // the path, so this must resolve identically to the line above
+            ("https://github.com/trinadhthatakula/Thor/tree/master", None),
+            // a ref *and* a subpath, the ambiguous shape: the first candidate
+            // (`main/axum-core`) does not exist, the second (`main`) does
+            ("https://github.com/tokio-rs/axum/tree/main/axum-core", None),
         ];
 
         for (url, ref_name) in cases {
@@ -1375,6 +1660,47 @@ mod tests {
             assert_eq!(from_graphql.owner, from_rest.owner);
             assert_eq!(from_graphql.repo, from_rest.repo);
         }
+    }
+
+    /// The live half of the `main`-vs-`master` fix. Asking for `main` on a
+    /// repository whose default branch is `master` must fail *and* say so —
+    /// through both resolution paths, since a user only ever hits one of them.
+    ///
+    /// ```text
+    /// GITHUB_TOKEN=$(gh auth token) cargo test github::tests::a_wrong_ref -- --ignored --nocapture
+    /// ```
+    #[tokio::test]
+    #[ignore = "hits api.github.com; needs GITHUB_TOKEN"]
+    async fn a_wrong_ref_reports_the_real_default_branch_from_both_paths() {
+        let token = std::env::var("GITHUB_TOKEN").expect("GITHUB_TOKEN must be set");
+        let graphql = GitHubClient::with_token(Some(token.clone())).unwrap();
+        let rest = GitHubClient::with_token(Some(token)).unwrap().without_graphql();
+        let url = "https://github.com/trinadhthatakula/Thor";
+
+        for (label, client) in [("graphql", &graphql), ("rest", &rest)] {
+            let error = client
+                .resolve_ref(url, Some("main".to_string()), true)
+                .await
+                .expect_err("`main` does not exist in this repository");
+            println!("{label}: {error:?}");
+            // `GitHubError` cannot derive `PartialEq` — `Request` wraps a
+            // `reqwest::Error` — so the shape is checked by hand.
+            match error {
+                GitHubError::RefNotFound { default_branch } => assert_eq!(
+                    default_branch.as_deref(),
+                    Some("master"),
+                    "{label} lost the default branch"
+                ),
+                other => panic!("{label} reported {other:?}, not a missing ref"),
+            }
+        }
+
+        // And the browse URL for that branch resolves without any ref argument.
+        let resolved = graphql
+            .resolve_ref(&format!("{url}/tree/master"), None, true)
+            .await
+            .unwrap();
+        assert_eq!(resolved.ref_name, "master");
     }
 
     #[test]
@@ -1405,5 +1731,130 @@ mod tests {
     #[test]
     fn rejects_unsupported_hosts() {
         assert!(GitHubClient::parse_repo_owner_name("https://example.com/a/b").is_err());
+    }
+
+    fn ref_candidates(input: &str) -> Vec<String> {
+        GitHubClient::parse_repo_url(input)
+            .unwrap()
+            .url_ref_candidates
+    }
+
+    /// The regression that started this: pasting a browse URL used to throw the
+    /// ref away, so `/tree/master` analysed whatever the default branch was.
+    #[test]
+    fn extracts_the_ref_from_a_browse_url() {
+        assert_eq!(
+            ref_candidates("https://github.com/trinadhthatakula/Thor/tree/master"),
+            vec!["master".to_string()]
+        );
+        assert_eq!(
+            ref_candidates("https://github.com/torvalds/linux/commit/ffc2532"),
+            vec!["ffc2532".to_string()]
+        );
+    }
+
+    /// `/tree/<ref>/<path>` cannot be disambiguated from a slashed ref by
+    /// inspection, so both readings are offered, longest first.
+    #[test]
+    fn offers_both_readings_of_an_ambiguous_browse_path() {
+        assert_eq!(
+            ref_candidates("https://github.com/tokio-rs/axum/tree/main/axum-core"),
+            vec!["main/axum-core".to_string(), "main".to_string()]
+        );
+        assert_eq!(
+            ref_candidates("https://github.com/acme/app/blob/release/1.x/src/main.rs"),
+            vec!["release/1.x/src/main.rs".to_string(), "release".to_string()]
+        );
+    }
+
+    /// A plain repository URL, and a path shape this parser does not recognise,
+    /// must contribute no candidates — resolution then uses the default branch
+    /// exactly as it always did.
+    #[test]
+    fn contributes_no_ref_candidates_without_a_ref_marker() {
+        assert!(ref_candidates("https://github.com/rust-lang/rust").is_empty());
+        assert!(ref_candidates("https://github.com/rust-lang/rust/issues/42").is_empty());
+        assert!(ref_candidates("https://github.com/rust-lang/rust/tree").is_empty());
+        // GitLab refs sit behind `/-/`, which this parser folds into the project
+        // path; guessing a ref out of it would be worse than not trying.
+        assert!(ref_candidates("https://gitlab.com/group/sub/project").is_empty());
+    }
+
+    /// A ref reaches GitHub as data and gets encoded on the way out, so the
+    /// escapes a browser put in the URL have to come off here. Left on,
+    /// `release%2020.1` went out as `release%252020.1` and 404ed.
+    #[test]
+    fn decodes_percent_escapes_in_a_browse_ref() {
+        assert_eq!(
+            ref_candidates("https://github.com/acme/app/tree/release%2020.1"),
+            vec!["release 20.1".to_string()]
+        );
+        // An encoded separator stays one path segment, so unlike a literal `/`
+        // it is not ambiguous: the slash is part of the branch name and there is
+        // only one reading to offer.
+        assert_eq!(
+            ref_candidates("https://github.com/acme/app/tree/release%2F1.x"),
+            vec!["release/1.x".to_string()]
+        );
+        // `%` on its own is not an escape sequence, and `100%` is a legal branch
+        // name: keep it rather than dropping the ref.
+        assert_eq!(
+            ref_candidates("https://github.com/acme/app/tree/100%"),
+            vec!["100%".to_string()]
+        );
+    }
+
+    /// Two distinct GitLab shapes used to fail the whole response on a bare
+    /// `String` default branch, surfacing as an unreadable upstream body: a
+    /// project with no commits, and a public project whose repository is
+    /// member-only or disabled, where the field is withheld entirely because
+    /// the caller lacks `read_code`. Only the first of those is empty, which is
+    /// what `empty_repo` is read for.
+    #[test]
+    fn deserializes_a_gitlab_project_without_a_default_branch() {
+        let body: GitLabProjectResponse = serde_json::from_str(
+            r#"{
+                "id": 42,
+                "path_with_namespace": "group/empty",
+                "default_branch": null,
+                "web_url": "https://gitlab.com/group/empty",
+                "visibility": "public",
+                "empty_repo": true
+            }"#,
+        )
+        .expect("a null default_branch must not fail the whole response");
+        assert_eq!(body.default_branch, None);
+        assert!(body.empty_repo);
+
+        // Repository feature member-only or disabled: the field is missing
+        // rather than null, and the project is not empty. The resolver has to
+        // tell this apart from the case above — it answers `private_repo`, not
+        // `empty_repository`.
+        let body: GitLabProjectResponse = serde_json::from_str(
+            r#"{
+                "id": 44,
+                "path_with_namespace": "group/issues-only",
+                "web_url": "https://gitlab.com/group/issues-only",
+                "visibility": "public"
+            }"#,
+        )
+        .expect("a withheld default_branch must not fail the whole response");
+        assert_eq!(body.default_branch, None);
+        assert!(!body.empty_repo);
+
+        // A populated project still deserializes, and `empty_repo` is absent
+        // from older API responses.
+        let body: GitLabProjectResponse = serde_json::from_str(
+            r#"{
+                "id": 43,
+                "path_with_namespace": "group/app",
+                "default_branch": "master",
+                "web_url": "https://gitlab.com/group/app",
+                "visibility": "public"
+            }"#,
+        )
+        .expect("a populated project must still deserialize");
+        assert_eq!(body.default_branch.as_deref(), Some("master"));
+        assert!(!body.empty_repo);
     }
 }

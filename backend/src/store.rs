@@ -3239,6 +3239,7 @@ mod tests {
                 crate::models::ApiErrorBody {
                     code: "bad_repo".to_string(),
                     message: "repository is invalid".to_string(),
+                    default_branch: None,
                 },
             )
             .await

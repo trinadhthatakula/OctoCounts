@@ -37,7 +37,10 @@ export function analyze(owner, repo, ref, forceRefresh = false) {
     headers,
     body: JSON.stringify({
       repoUrl: `https://github.com/${owner}/${repo}`,
-      refName: ref,
+      // Omitted when the page did not say which ref it is showing, which asks
+      // the API for the repository's default branch. Sending a guess instead is
+      // what made every non-`main` repository fail.
+      refName: ref || undefined,
       forceRefresh,
       source: 'extension',
     }),

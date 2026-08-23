@@ -230,6 +230,9 @@ impl AnalysisCoordinator {
                 ApiErrorBody {
                     code: code.to_string(),
                     message: message.to_string(),
+                    // Ref resolution happens in `submit`, before a job exists,
+                    // so no job failure is ever a `ref_not_found`.
+                    default_branch: None,
                 },
             )
             .await

@@ -1,0 +1,353 @@
+name: Tests
+
+# Until this file existed, no workflow in this repository ran a test suite on a
+# pull request. build-images.yml and extension-release.yml build artifacts,
+# extension-dom-monitor.yml drives live GitHub every six hours, and
+# refresh-github-trending.yml runs two unit tests on a schedule — so nothing
+# ever ran `cargo test`, `cargo clippy`, the frontend SEO suite or the
+# extension DOM tests before a merge. A green Actions run did not mean the
+# tests passed. This is the workflow that makes it mean that.
+#
+# Every command here was run on the branch that introduced it before being
+# written down: backend 164 passed, frontend 30, extension 33 + 8, scripts 2,
+# and the three thin-client guards exit 0 with no outbound network.
+#
+# What is deliberately absent, and why:
+#
+#   frontend/qa/visual-qa.spec.ts — nine Playwright tests needing a ~94 MiB
+#     browser download and a hand-started dev server (playwright.config.ts has
+#     no `webServer` block), leaning on ten fixed waitForTimeout() sleeps, and
+#     including one that fails today for a pre-existing reason: the lazily
+#     loaded zh bundle lands after react-i18next has already re-rendered, so
+#     the language switcher leaves the page in English. A check that is red on
+#     arrival teaches people to ignore checks.
+#
+#   extension/tests/smoke/ — drives real github.com through a headed Chromium.
+#     Already covered by extension-dom-monitor.yml, which exists precisely so
+#     that a GitHub redesign pages whoever is on call instead of reddening
+#     every unrelated pull request.
+#
+#   `npm audit` and `-D warnings` — frontend's tree reports four advisories
+#     today and clippy reports eight warnings, all pre-existing. Gating on
+#     either would fail every pull request for something its author did not
+#     write. Both are their own change.
+#
+# No `paths:` filters. Four jobs at a few minutes each is cheap, and a filtered
+# job cannot serve as a required status check without a skip-shim job beside
+# it — complexity that buys nothing at this size.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Explicit even though this repository's default GITHUB_TOKEN is already
+# read-only: a workflow that omits the key inherits that default silently, and
+# whoever adds the next step here should have to say what it needs. Nothing in
+# this file writes to the repository. (A pull request opened from a fork gets a
+# read-only token and no secrets whatever this block asks for, so nothing here
+# may depend on posting comments or uploading results.)
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  backend:
+    name: backend · cargo test against Postgres 17
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        # There is no workspace manifest at the repository root; the crate is
+        # backend/Cargo.toml.
+        working-directory: backend
+    env:
+      CARGO_TERM_COLOR: always
+      RUST_BACKTRACE: 1
+      PGPASSWORD: postgres
+      # The single switch that arms the 63 database-backed tests (read in
+      # store.rs, golden.rs, coordinator.rs, api.rs and main.rs). Without it
+      # every one of them returns early and still reports `ok`, and the summary
+      # line is byte-identical to a real run — measured, not assumed. This is
+      # the warning CLAUDE.md opens the backend section with.
+      TEST_DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/octocounts_test
+      #
+      # Three variables are deliberately absent, and each omission is
+      # load-bearing:
+      #
+      #   OCTOCOUNTS_UPDATE_GOLDEN — flips assert_golden from "compare" to
+      #     "overwrite src/testdata/*.json", which makes the 13 golden tests
+      #     structurally incapable of failing. The guard step below catches it
+      #     even if someone sets it.
+      #   GITHUB_TOKEN — wanted only by the two #[ignore]d live-network tests.
+      #     No other test's outcome depends on it: the one test that asserts
+      #     the GraphQL fast path is armed only with a token uses the explicit
+      #     with_token() constructor so it never races the process
+      #     environment. Setting it here would invite `--include-ignored`,
+      #     which puts api.github.com and its rate limits in the critical path
+      #     of every pull request.
+      #   DATABASE_URL — store.rs's tests fall back to it, so a stray value
+      #     would silently retarget a third of the suite at another database.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          # Nothing in the suite issues CREATE DATABASE. Each harness runs
+          # CREATE SCHEMA test_schema_<uuid> *inside* the database the URL
+          # names, so that database has to exist first and its name has to
+          # match the URL above. No extensions are required — there is no
+          # CREATE EXTENSION in store.rs::migrate(), and ids come from the Rust
+          # uuid crate rather than gen_random_uuid().
+          POSTGRES_DB: octocounts_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d octocounts_test"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # No toolchain action: ubuntu-latest ships stable Rust with clippy and
+      # rustfmt already installed, backend/Cargo.toml declares no rust-version,
+      # and there is no rust-toolchain.toml — so there is no MSRV contract for
+      # a pinned toolchain to honour. Print the versions instead, so a runner
+      # image bump is visible in the log of the run it breaks. If this repo
+      # ever needs nightly, a pinned version or an extra target, add
+      # dtolnay/rust-toolchain@stable here (a branch ref, not @v1).
+      - name: Record the toolchain
+        run: |
+          set -euo pipefail
+          rustc --version
+          cargo --version
+          cargo clippy --version
+
+      # The one third-party action in this workflow. A cold build of this
+      # dependency tree (aws-lc-sys through rustls, mimalloc, tokei's ~200
+      # parsers) is minutes of the job; actions/cache alone would cache the
+      # crates but not prune target/, which is what keeps the entry from
+      # growing past the point where restoring it costs more than compiling.
+      # The job's token is read-only and it holds no secrets, so the blast
+      # radius is a poisoned build cache rather than a leak.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: backend
+
+      - name: Prove the database exists and accepts DDL
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 30); do
+            if pg_isready -h 127.0.0.1 -p 5432 -U postgres -d octocounts_test >/dev/null 2>&1; then
+              break
+            fi
+            sleep 2
+          done
+          # Four of the five harnesses end their connect with `.ok()?`, which
+          # swallows a connection error and skips the test. A misnamed database
+          # or a container that is not up yet would therefore delete tests
+          # rather than fail them. Fail here instead, where it is visible.
+          psql "$TEST_DATABASE_URL" -Atc 'select current_database(), current_user'
+          # CREATE on the database is the only privilege the harnesses need.
+          psql "$TEST_DATABASE_URL" -Atc 'create schema ci_probe; drop schema ci_probe'
+
+      - name: Record the transaction baseline
+        run: |
+          set -euo pipefail
+          before=$(psql "$TEST_DATABASE_URL" -Atc \
+            "select xact_commit from pg_stat_database where datname = current_database()")
+          echo "PG_XACT_BEFORE=$before" >> "$GITHUB_ENV"
+
+      - name: cargo test
+        run: |
+          set -euo pipefail
+          # --nocapture so the tests that announce their own skip actually say
+          # so in the log; the step below reads it. No --include-ignored: the
+          # four ignored tests reach api.github.com or want multi-hundred-MB
+          # tarball fixtures.
+          cargo test --locked -- --nocapture 2>&1 | tee "$RUNNER_TEMP/backend-test.log"
+
+      - name: Prove the database-backed tests ran instead of skipping
+        run: |
+          set -euo pipefail
+          # Signal 1: the 16 tests that announce a skip (api.rs, coordinator.rs,
+          # main.rs) printed nothing. On its own this check would miss the other
+          # 47 — every test in store.rs and golden.rs skips with a bare
+          # `return` and no output at all.
+          if grep -q 'skipping: TEST_DATABASE_URL' "$RUNNER_TEMP/backend-test.log"; then
+            grep -n 'skipping: TEST_DATABASE_URL' "$RUNNER_TEMP/backend-test.log" | head
+            echo "::error::TEST_DATABASE_URL never reached the test binary; 63 tests passed by doing nothing"
+            exit 1
+          fi
+          # Signal 2: the server's own counter, which is the only evidence that
+          # covers the silent 47. Every gated test creates a schema and runs
+          # migrate() — 44 autocommit statements — so a real run commits
+          # thousands of transactions and a fully skipped run commits none.
+          #
+          # Asserting the passing-test count instead would prove nothing: it
+          # reads `164 passed` with the variable set or unset. Pinning that
+          # number would also make every pull request that adds a test edit
+          # this file.
+          after=$(psql "$TEST_DATABASE_URL" -Atc \
+            "select xact_commit from pg_stat_database where datname = current_database()")
+          delta=$(( after - PG_XACT_BEFORE ))
+          echo "postgres committed $delta transactions during cargo test"
+          if [ "$delta" -lt 1000 ]; then
+            echo "::error::only $delta transactions committed; the database-backed tests did not run"
+            exit 1
+          fi
+          echo "Database-backed tests confirmed: $delta committed transactions, no skip messages." \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Golden fixtures must not have been rewritten
+        # A diff here means the suite regenerated src/testdata/*.json instead of
+        # asserting against it — the failure mode OCTOCOUNTS_UPDATE_GOLDEN
+        # causes, and the one that would leave every API-response test unable
+        # to fail while still reporting `ok`.
+        run: git diff --exit-code -- src/testdata
+
+      - name: cargo clippy
+        # Advisory, not gating. Eight warnings pre-date this workflow (two
+        # manual is_multiple_of and two manual div_ceil in badge.rs, three
+        # clone-on-Copy in coordinator.rs/github.rs, one large_enum_variant in
+        # models.rs). `-D warnings` today would fail every pull request for
+        # something its author did not write; the count in the summary is so
+        # that a ninth warning is at least visible while that is true.
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          cargo clippy --locked --all-targets --message-format short 2>&1 \
+            | tee "$RUNNER_TEMP/backend-clippy.log"
+          count=$(grep -cE '^src/.*warning:' "$RUNNER_TEMP/backend-clippy.log" || true)
+          echo "clippy: $count unique warnings (baseline when this workflow landed: 8)." \
+            >> "$GITHUB_STEP_SUMMARY"
+
+  frontend:
+    name: frontend · tsc, vite build, 30 SEO tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      # `npm ci` hard-errors on any drift between package.json and the
+      # lockfile, so a green install here is also the lockfile-sync check.
+      - run: npm ci
+
+      # test:seo is prebuild (copy the JetBrains Mono subset out of
+      # node_modules) → tsc → vite build → node --test tests/seo.test.mjs, so
+      # this one step is the type check as well. The build is not optional: the
+      # suite asserts on dist/index.html *and* on functions/[[path]].js, the
+      # two places page metadata is injected and which have to agree or a
+      # hydration flip turns an indexable page into a noindex one. Every fetch
+      # in the suite is stubbed; nothing here reaches the network.
+      - run: npm run test:seo
+
+  extension:
+    name: extension · 33 DOM tests, 3 builds, 8 artifact tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: extension
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: extension/package-lock.json
+
+      - run: npm ci
+
+      # `npm test` is test:unit (github-dom.test.mjs, replaying captured real
+      # GitHub pages through linkedom) → build:all (chrome, edge, firefox) →
+      # build-artifacts.test.mjs. Do not split it into separate steps to get
+      # nicer names: the artifact tests read dist/ for all three targets, and
+      # assertions like "no artifact mentions another browser's store" only
+      # hold if every target was just built.
+      - run: npm test
+
+  thin-surfaces:
+    name: scripts, cli, mcp, action · no install, no network
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          # No npm cache and no install: none of these surfaces has a lockfile
+          # or a dependency, and `npm ci` fails outright without one.
+
+      # Safe on every pull request. The test feeds literal HTML to
+      # parseTrendingHtml; the module's network entry point sits behind an
+      # `import.meta.url === argv[1]` guard, so importing it never calls
+      # fetchTrending. The scheduled refresh workflow keeps running the
+      # half that does talk to github.com.
+      - name: scripts unit tests
+        run: node --test scripts/refresh-github-trending.test.mjs
+
+      # A syntax floor over every dependency-free ESM source, including the
+      # Cloudflare Pages function that owns server-side metadata, redirects and
+      # the sitemap and is otherwise never parsed by anything in CI. These
+      # parse as modules because each nearest package.json sets
+      # "type": "module" (scripts/*.mjs by extension) — Node picks the goal
+      # from the package, not the file name.
+      - name: syntax check the no-build surfaces
+        run: |
+          node --check cli/src/index.js
+          node --check mcp/src/index.js
+          node --check action/src/index.js
+          node --check action/src/comment.js
+          node --check scripts/refresh-github-trending.mjs
+          node --check scripts/refresh-llms-lastupdated.mjs
+          node --check scripts/seed-popular-repos.mjs
+          node --check 'frontend/functions/[[path]].js'
+          node --check frontend/functions/compare-registry.js
+
+      # --check is syntax only: a file importing a module that no longer exists
+      # still passes it (verified). The three steps below are the ones that
+      # actually resolve these module graphs, and each stops before its first
+      # fetch, so they need no network.
+      - name: cli renders its offline sample report
+        working-directory: cli
+        run: npm run --silent sample
+
+      # The only check that resolves action/src/index.js's import of
+      # ./comment.js — rename that file and --check stays green while the
+      # action breaks for everyone using it.
+      - name: action renders its offline sample comment
+        working-directory: action
+        run: npm run --silent sample
+
+      # mcp/ has no sample script and blocks on stdin, so drive one framed
+      # JSON-RPC initialize through it instead. Closing stdin fires its
+      # stdin 'end' handler, so the step terminates on its own.
+      - name: mcp answers an initialize handshake over stdio
+        working-directory: mcp
+        shell: bash
+        run: |
+          set -euo pipefail
+          BODY='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}'
+          printf 'Content-Length: %d\r\n\r\n%s' "${#BODY}" "$BODY" \
+            | node src/index.js \
+            | grep -q '"serverInfo"'

@@ -15,7 +15,7 @@ import {
   fingerprintHash,
   LANGUAGE_HEADINGS,
 } from '../src/content/github-dom.js';
-import { getRepoVisibility, isPrivateRepo } from '../src/content/detect.js';
+import { getRepoVisibility, isPrivateRepo, parseRepoInfo } from '../src/content/detect.js';
 
 const FIXTURES = new URL('./fixtures/', import.meta.url);
 
@@ -294,6 +294,116 @@ test('an unrelated public repository in embedded data cannot prove this page is 
   `);
 
   assert.equal(getRepoVisibility(document), 'unknown');
+});
+
+/* ── ref resolution ──────────────────────────────────────────────────────── */
+
+// GitHub keeps `refInfo` under the route wrapper for the page type it is
+// rendering. Reading only `codeViewRepoRoute` is what left tree views with no
+// ref at all, so each wrapper gets its own case.
+function pageWithPayload(payload, extraHead = '') {
+  const { document } = parseHTML(`
+    <html><head>
+      ${extraHead}
+      <script type="application/json" data-target="react-app.embeddedData">
+        ${JSON.stringify({ payload })}
+      </script>
+    </head><body><div id="repository-container-header"></div></body></html>
+  `);
+  return document;
+}
+
+test('a repo whose default branch is not main reports that branch, not a guess', () => {
+  const document = pageWithPayload({
+    codeViewLayoutRoute: { refInfo: { name: 'master' } },
+  });
+  assert.equal(parseRepoInfo('/trinadhthatakula/Thor', document).ref, 'master');
+});
+
+test('a tree view reports the branch, never the path it is nested in', () => {
+  const document = pageWithPayload({
+    codeViewLayoutRoute: { refInfo: { name: 'master' } },
+    codeViewTreeRoute: { refInfo: { name: 'master' } },
+  });
+  // `master/app` was the old answer here, and the API rejects it.
+  assert.equal(parseRepoInfo('/trinadhthatakula/Thor/tree/master/app', document).ref, 'master');
+});
+
+test('a ref containing slashes survives, and is preferred over its first segment', () => {
+  const document = pageWithPayload({
+    codeViewTreeRoute: { refInfo: { name: 'release/1.x' } },
+  });
+  assert.equal(parseRepoInfo('/octo/demo/tree/release/1.x', document).ref, 'release/1.x');
+  assert.equal(parseRepoInfo('/octo/demo/tree/release/1.x/src', document).ref, 'release/1.x');
+});
+
+test('the ref is found under a route wrapper this code has never seen', () => {
+  const document = pageWithPayload({
+    someFutureRouteName: { refInfo: { name: 'develop' } },
+  });
+  assert.equal(parseRepoInfo('/octo/demo/tree/develop', document).ref, 'develop');
+});
+
+test('an abbreviated SHA in the URL resolves to the full SHA the page states', () => {
+  const sha = 'ea91b33ca57ff0581b38e735cc108f831bccbdaa';
+  const document = pageWithPayload({
+    codeViewLayoutRoute: { refInfo: { name: sha } },
+  });
+  // GitHub expands the abbreviation in the payload, so neither the equality nor
+  // the `<ref>/` prefix test matches. This resolved to `''` before, which the
+  // API reads as "default branch" — so a page pinned to a commit silently
+  // reported the default branch's count.
+  assert.equal(parseRepoInfo('/tokio-rs/tokio/tree/ea91b33', document).ref, sha);
+  assert.equal(parseRepoInfo('/tokio-rs/tokio/tree/ea91b33/tokio', document).ref, sha);
+  // The full SHA still works through the ordinary path.
+  assert.equal(parseRepoInfo(`/tokio-rs/tokio/tree/${sha}`, document).ref, sha);
+});
+
+test('the SHA expansion cannot resolve a branch name to a similar branch name', () => {
+  // The guard that makes the check above safe: matching a candidate that merely
+  // *starts with* the path would resolve `/tree/main` to `main-v2`. Only a hex
+  // abbreviation expanding to a full SHA qualifies.
+  const nearMiss = pageWithPayload({
+    codeViewLayoutRoute: { refInfo: { name: 'main-v2' } },
+  });
+  assert.equal(parseRepoInfo('/octo/demo/tree/main', nearMiss).ref, '');
+
+  // `deadbee` is hex and abbreviation-shaped, but a 7-char candidate is a
+  // branch name, not an expansion of one.
+  const shortCandidate = pageWithPayload({
+    codeViewLayoutRoute: { refInfo: { name: 'deadbeef' } },
+  });
+  assert.equal(parseRepoInfo('/octo/demo/tree/deadbee', shortCandidate).ref, '');
+});
+
+test('a repo home with no payload falls back to the default-branch meta tag', () => {
+  const { document } = parseHTML(`
+    <html><head>
+      <meta name="octolytics-dimension-repository_default_branch" content="trunk">
+    </head><body><div id="repository-container-header"></div></body></html>
+  `);
+  assert.equal(parseRepoInfo('/octo/demo', document).ref, 'trunk');
+});
+
+test('an unresolvable ref is reported as empty, which means "use the default branch"', () => {
+  // No payload and no meta on a tree view: the page cannot say what it shows,
+  // and the URL path is not a ref. `HEAD` was the old answer, the path was the
+  // one before that — both are claims this code cannot support.
+  const { document } = parseHTML('<html><body><div id="repository-container-header"></div></body></html>');
+  assert.equal(parseRepoInfo('/octo/demo/tree/master/app', document).ref, '');
+  assert.equal(parseRepoInfo('/octo/demo', document).ref, '');
+  // Not a repository route at all.
+  assert.equal(parseRepoInfo('/octo/demo/issues', document).ref, '');
+});
+
+test('the branch button is used when the payload has no ref', () => {
+  const { document } = parseHTML(`
+    <html><body>
+      <div id="repository-container-header"></div>
+      <summary data-hotkey="w"><span>master</span></summary>
+    </body></html>
+  `);
+  assert.equal(parseRepoInfo('/octo/demo/tree/master/app', document).ref, 'master');
 });
 
 /* ── diagnostics ─────────────────────────────────────────────────────────── */

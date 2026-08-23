@@ -55,6 +55,15 @@ pub enum JobStatus {
 pub struct ApiErrorBody {
     pub code: String,
     pub message: String,
+    /// Set only on `ref_not_found`, and only when the resolver knew it. Clients
+    /// localize `message` from `code`, which throws the branch name away, so the
+    /// one fact that makes a `main`-vs-`master` mismatch fixable has to travel
+    /// as data.
+    ///
+    /// Additive and omitted when absent: existing clients keep parsing the body,
+    /// and job rows written before this field deserialize with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_branch: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

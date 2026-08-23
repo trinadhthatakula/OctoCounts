@@ -359,7 +359,13 @@ function App() {
                 onCancelTyping={stopTyping}
                 onChange={(next) => {
                   setRepoUrl(next);
-                  setRefName("main");
+                  // This was `setRefName("main")`, which wrote a ref nobody
+                  // asked for on every keystroke: every repository whose
+                  // default branch is not `main` — `master`, `develop`,
+                  // `trunk` — failed with `ref_not_found`, and the injected
+                  // value was indistinguishable from the field's own hint.
+                  // Empty means "let the server use the default branch".
+                  setRefName(refFromRepoUrl(next));
                 }}
                 placeholder={t("hero.placeholderUrl")}
                 ariaLabel={t("hero.ariaUrl")}
@@ -1282,6 +1288,48 @@ function parsePublicRepo(value: string) {
     };
   } catch {
     return null;
+  }
+}
+
+// Path segments after which a github.com URL names a ref.
+const githubRefMarkers = new Set(["tree", "blob", "commit", "commits"]);
+
+/**
+ * Reads the ref out of a pasted browse URL, so opening
+ * `github.com/owner/repo/tree/master` and pressing Analyze counts `master`.
+ *
+ * Only the unambiguous shape counts: exactly one segment after the marker.
+ * `/tree/main/src` is either branch `main` plus a directory or a branch named
+ * `main/src`, and nothing on this side can tell which — the backend tries both
+ * readings against the real ref list, so the field stays empty and it decides.
+ */
+function refFromRepoUrl(value: string) {
+  try {
+    const url = new URL(value.trim());
+    if (url.hostname !== "github.com") return "";
+    const segments = url.pathname.split("/").filter(Boolean);
+    if (segments.length !== 4 || !githubRefMarkers.has(segments[2])) return "";
+    return decodeRefSegment(segments[3]);
+  } catch {
+    return "";
+  }
+}
+
+/**
+ * `url.pathname` is percent-encoded, but the ref goes to the API as data and is
+ * re-encoded by `encodeRefPath` on the way into links. Decoded here it matches
+ * what `parsePublicReportPath` produces from the same ref; left encoded it
+ * became the ref name `release%2020.1` and double-encoded from there.
+ *
+ * A bare `%` throws and is not an error: `100%` is a legal branch name, so an
+ * undecodable segment is kept rather than silently falling back to the default
+ * branch.
+ */
+function decodeRefSegment(segment: string) {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
   }
 }
 

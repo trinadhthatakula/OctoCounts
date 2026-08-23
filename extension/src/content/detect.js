@@ -94,49 +94,106 @@ export function getRepoVisibility(root = document) {
   return publicSignal ? 'public' : 'unknown';
 }
 
-export function parseRepoInfo() {
-  const route = parseRoute(window.location.pathname);
-  if (!route) return { owner: undefined, repo: undefined, ref: 'HEAD', isFork: false };
+/**
+ * `ref` is `''` when the page does not say which ref it is showing. That means
+ * "let the API use the repository's default branch" — the only honest answer,
+ * and one every consumer already handles (`cacheKey`/`inflightKey` fall back to
+ * `HEAD`, and `analyze()` omits an empty ref from the request).
+ *
+ * It must never be a path. Returning `treePath` — the old fallback — sent
+ * `master/app` as a ref on `/tree/master/app`, which the API rejects with
+ * `ref_not_found`.
+ */
+export function parseRepoInfo(pathname = window.location.pathname, root = document) {
+  const route = parseRoute(pathname);
+  if (!route) return { owner: undefined, repo: undefined, ref: '', isFork: false };
 
   const { owner, repo, treePath } = route;
-  const payload = readEmbeddedPayload(document);
-
-  const embeddedRef = payload?.codeViewRepoRoute?.refInfo?.name?.trim()
-    || payload?.refInfo?.name?.trim()
-    || '';
+  const payload = readEmbeddedPayload(root);
 
   const refEl =
-    document.querySelector('[data-hotkey="w"] .css-truncate-target') ??
-    document.querySelector('summary[data-hotkey="w"] span');
+    root.querySelector('[data-hotkey="w"] .css-truncate-target') ??
+    root.querySelector('summary[data-hotkey="w"] span');
   const buttonRef = refEl?.textContent?.trim() || '';
 
-  const metaRef = document.querySelector(
+  const metaRef = root.querySelector(
     'meta[name="octolytics-dimension-repository_default_branch"]'
-  )?.content;
+  )?.content?.trim() || '';
 
   return {
     owner,
     repo,
-    ref: resolveRefFromPage(treePath, embeddedRef, buttonRef, metaRef),
-    isFork: detectFork(payload),
+    ref: resolveRefFromPage(treePath, refsFromPayload(payload), buttonRef, metaRef),
+    isFork: detectFork(payload, root),
   };
 }
 
-function resolveRefFromPage(treePath, embeddedRef, buttonRef, metaRef) {
-  if (!treePath) return embeddedRef || buttonRef || metaRef || 'HEAD';
+/**
+ * Every ref the embedded payload claims, in precedence order.
+ *
+ * `codeViewRepoRoute` alone was the bug: GitHub keeps `refInfo` under the route
+ * wrapper for the page type being rendered, and on a tree view that is
+ * `codeViewTreeRoute`, not `codeViewRepoRoute`. `codeViewLayoutRoute` carries it
+ * on every code-view page type, which makes it the one to trust first.
+ */
+function refsFromPayload(payload) {
+  if (!payload) return [];
 
-  // GitHub encodes refs with slashes as /tree/feature/name, which is ambiguous
-  // with /tree/<ref>/<folder>. The branch/tag button has the full resolved ref.
-  if (embeddedRef && treePath.startsWith(embeddedRef)) return embeddedRef;
-  if (buttonRef && treePath.startsWith(buttonRef)) return buttonRef;
+  const refs = [];
+  const add = value => {
+    const name = typeof value === 'string' ? value.trim() : '';
+    if (name && !refs.includes(name)) refs.push(name);
+  };
 
-  return treePath || embeddedRef || buttonRef || metaRef || 'HEAD';
+  add(payload.codeViewLayoutRoute?.refInfo?.name);
+  add(payload.codeViewTreeRoute?.refInfo?.name);
+  add(payload.codeViewFileTreeLayoutRoute?.refInfo?.name);
+  add(payload.codeViewRepoRoute?.refInfo?.name);
+  add(payload.refInfo?.name);
+
+  // Bounded structural fallback, same shape as repoCandidatesFromPayload: when
+  // GitHub renames the wrapper again, the ref is still under a `refInfo` key.
+  const visit = (value, depth = 0) => {
+    if (!value || typeof value !== 'object' || depth > 8) return;
+    if (Array.isArray(value)) {
+      for (const item of value.slice(0, 100)) visit(item, depth + 1);
+      return;
+    }
+    for (const [key, child] of Object.entries(value)) {
+      if (key === 'refInfo') add(child?.name);
+      visit(child, depth + 1);
+    }
+  };
+  visit(payload);
+
+  return refs;
+}
+
+function resolveRefFromPage(treePath, payloadRefs, buttonRef, metaRef) {
+  const candidates = [...payloadRefs];
+  if (buttonRef) candidates.push(buttonRef);
+
+  // `/tree/feature/name` and `/tree/<ref>/<folder>` are the same URL shape, so
+  // the path cannot resolve itself. A ref the page states and that the path
+  // starts with is the ref being viewed; nothing else can be.
+  if (treePath) {
+    const fromPath = candidates.find(
+      ref => treePath === ref || treePath.startsWith(`${ref}/`)
+    );
+    if (fromPath) return fromPath;
+    // The page disagrees with the URL — mid-navigation, or a payload shape this
+    // code no longer understands. The default branch is not what is on screen,
+    // so claiming it would be worse than saying nothing.
+    return '';
+  }
+
+  return candidates[0] || metaRef;
 }
 
 // The skipForks setting fails silently when this returns a wrong answer, so the
 // embedded payload comes first here too — `.fork-flag` and `.pagehead-heading-text`
 // no longer exist on the React repo header.
-function detectFork(payload) {
+function detectFork(payload, root = document) {
   const repo = repoFromPayload(payload);
   if (repo) {
     if (repo.isFork === true || repo.fork === true) return true;
@@ -144,10 +201,10 @@ function detectFork(payload) {
     if (repo.isFork === false || repo.fork === false) return false;
   }
 
-  if (document.querySelector('.fork-flag')) return true;
-  if (document.querySelector('[data-testid="fork-flag"]')) return true;
+  if (root.querySelector('.fork-flag')) return true;
+  if (root.querySelector('[data-testid="fork-flag"]')) return true;
 
-  const header = repoHeader(document);
+  const header = repoHeader(root);
   if (header?.textContent?.includes('forked from')) return true;
 
   return false;

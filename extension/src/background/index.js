@@ -98,6 +98,10 @@ function classifyError(err) {
       code: apiError.code,
       status: err.status,
       detail: apiError.detail || apiError.details || err.responseText || '',
+      // The one piece of the API message worth keeping: on `ref_not_found` it
+      // names the branch that does exist, which is what a card on a `master`
+      // repository needs to say instead of a bare "Analysis failed".
+      defaultBranch: typeof apiError.defaultBranch === 'string' ? apiError.defaultBranch : undefined,
     };
   }
 

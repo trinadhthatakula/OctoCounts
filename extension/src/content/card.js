@@ -6,7 +6,13 @@ import { mountPanel, unmountPanel } from './panel.js';
 
 const POLL_TIMEOUT_MS = 5 * 60 * 1000;
 const MAX_RETRIES = 4;
-const NON_RETRYABLE = new Set(['too_large', 'private_repo', 'forbidden', 'auth_error']);
+// Retrying cannot change any of these answers. `ref_not_found`,
+// `empty_repository` and `not_found` are facts about the repository, so the four
+// retries below only spent ~15s producing the same failure a fifth time.
+const NON_RETRYABLE = new Set([
+  'too_large', 'private_repo', 'forbidden', 'auth_error',
+  'ref_not_found', 'empty_repository', 'not_found', 'invalid_url',
+]);
 const STAR_SUCCESS_COUNT_KEY = 'starPromptSuccessCount';
 
 const SKEL_WIDTHS  = [78, 60, 70, 52, 65, 74, 58, 68];
@@ -402,6 +408,10 @@ function errorMessage(error) {
     auth_error:   t('error.authError'),
     offline:      t('error.offline'),
     timeout:      t('card.error.timedOut'),
+    empty_repository: t('error.emptyRepository'),
+    ref_not_found: error?.defaultBranch
+      ? t('error.refNotFoundWithDefault', { branch: error.defaultBranch })
+      : t('error.refNotFound'),
   };
   return codeMap[error?.code] || error?.message || t('error.unknown');
 }

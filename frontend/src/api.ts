@@ -59,14 +59,31 @@ function apiErrorMessage(body: unknown, fallback: string) {
 
   const code = "code" in body && typeof body.code === "string" ? body.code : "";
   const message = "message" in body && typeof body.message === "string" ? body.message : "";
-  return localizedErrorCodeMessage(code, message || fallback, "error.requestFailed");
+  const defaultBranch =
+    "defaultBranch" in body && typeof body.defaultBranch === "string" ? body.defaultBranch : undefined;
+  return localizedErrorCodeMessage(code, message || fallback, "error.requestFailed", defaultBranch);
 }
 
 // Single source of truth for error-code → i18n mapping; shared with useAnalysisRunner.
-export function localizedErrorCodeMessage(code: string | undefined, fallback: string, fallbackKey: string) {
+//
+// `defaultBranch` is the server's answer to "then what should I have asked
+// for?", sent on `ref_not_found` when the resolver knew it. Localizing by code
+// discards the server's message, so it has to be re-inserted here or the one
+// useful fact in the response never reaches the screen.
+export function localizedErrorCodeMessage(
+  code: string | undefined,
+  fallback: string,
+  fallbackKey: string,
+  defaultBranch?: string,
+) {
   if (code === "private_repo") return i18n.t("error.privateRepo");
   if (code === "invalid_url") return i18n.t("error.invalidUrl");
-  if (code === "ref_not_found") return i18n.t("error.refNotFound");
+  if (code === "ref_not_found") {
+    return defaultBranch
+      ? i18n.t("error.refNotFoundWithDefault", { branch: defaultBranch })
+      : i18n.t("error.refNotFound");
+  }
+  if (code === "empty_repository") return i18n.t("error.emptyRepository");
   if (code === "rate_limited") return i18n.t("error.rateLimited");
   if (code === "github_unavailable") return i18n.t("error.githubUnavailable");
   if (code === "too_large") return i18n.t("error.tooLarge");

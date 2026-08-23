@@ -412,6 +412,11 @@ function errorMessage(error) {
     ref_not_found: error?.defaultBranch
       ? t('error.refNotFoundWithDefault', { branch: error.defaultBranch })
       : t('error.refNotFound'),
+    // classifyError() keeps only `code` and `defaultBranch` from the API body,
+    // so an unmapped code has no `message` to fall back on and renders as
+    // "Analysis failed" with no retry button — no explanation and no action.
+    // Every code in NON_RETRYABLE therefore needs an entry here.
+    invalid_url: t('error.invalidUrl'),
   };
   return codeMap[error?.code] || error?.message || t('error.unknown');
 }

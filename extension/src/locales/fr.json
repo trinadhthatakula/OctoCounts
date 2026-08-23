@@ -107,6 +107,7 @@
     "refNotFound": "La branche affichée sur cette page n'a pas pu être comptée.",
     "refNotFoundWithDefault": "La branche affichée sur cette page n'a pas pu être comptée. La branche par défaut de ce dépôt est « {{branch}} ».",
     "emptyRepository": "Ce dépôt n'a aucun commit à compter",
+    "invalidUrl": "Cette adresse de dépôt n'a pas pu être lue",
     "authError": "Échec de l'autorisation API OctoCounts",
     "offline": "Pas de connexion réseau",
     "unknown": "Échec de l'analyse",

@@ -107,6 +107,7 @@
     "refNotFound": "このページが表示しているブランチを集計できませんでした。",
     "refNotFoundWithDefault": "このページが表示しているブランチを集計できませんでした。このリポジトリのデフォルトブランチは「{{branch}}」です。",
     "emptyRepository": "このリポジトリには集計できるコミットがありません",
+    "invalidUrl": "このリポジトリのアドレスを読み取れませんでした",
     "authError": "OctoCounts APIの認証に失敗しました",
     "offline": "ネットワーク接続がありません",
     "unknown": "分析に失敗しました",

@@ -107,6 +107,7 @@
     "refNotFound": "The branch this page is showing could not be counted.",
     "refNotFoundWithDefault": "The branch this page is showing could not be counted. This repository's default branch is \"{{branch}}\".",
     "emptyRepository": "This repository has no commits to count",
+    "invalidUrl": "This repository address could not be read",
     "authError": "OctoCounts API authorization failed",
     "offline": "No network connection",
     "unknown": "Analysis failed",

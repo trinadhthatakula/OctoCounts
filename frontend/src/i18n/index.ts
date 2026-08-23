@@ -35,6 +35,19 @@ i18n
       order: ["querystring", "localStorage", "navigator"],
       caches: ["localStorage"],
     },
+    // Without this, switching to Chinese in a running page left the entire UI
+    // in English until a reload. react-i18next re-renders on `languageChanged`,
+    // which i18next emits *synchronously* — before the lazy zh chunk above has
+    // resolved, so every `t()` in that render falls back to English. The chunk
+    // then lands and `addResourceBundle` emits `added` on the resource store,
+    // which react-i18next does not listen to by default, so nothing repaints
+    // and the fallback render is the one the visitor keeps.
+    //
+    // The first-load path never showed this because main.tsx awaits `ready`
+    // before mounting, so the bundle is already in place by the first render.
+    // Only the in-page switch was broken, which is why it survived: the
+    // language persists to localStorage, so a reload looks correct and hides it.
+    react: { bindI18nStore: "added" },
   });
 
 export default i18n;

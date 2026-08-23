@@ -47,10 +47,24 @@ services:
     environment:
       VITE_API_BASE: ${VITE_API_BASE:-http://127.0.0.1:8080}
       VITE_DEBUG_SHARE_PREVIEW: ${VITE_DEBUG_SHARE_PREVIEW:-false}
+      # Without this the bind mount gives the container no filesystem events and
+      # the dev server never reloads — see the comment in frontend/vite.config.ts.
+      # Overridable for a Linux host, where inotify crosses the mount natively.
+      VITE_USE_POLLING: ${VITE_USE_POLLING:-true}
     command: sh -c "npm ci && npm exec vite -- --host 0.0.0.0 --port 5173"
     volumes:
       - ./frontend:/app
       - frontend-node-modules:/app/node_modules
+      # vite.config.ts reads ../extension/package.json at config-load time to
+      # inject the extension version into index.html's JSON-LD, so with only
+      # ./frontend mounted the dev server died on boot with
+      # `ENOENT: /extension/package.json` — `docker compose up` brought up the
+      # API and Postgres and no website at all. Mounted at that absolute path
+      # to mirror `COPY extension/package.json /extension/package.json` in
+      # frontend/Dockerfile: the version is real structured data that
+      # tests/seo.test.mjs asserts is substituted, so the fix is to supply the
+      # file, not to teach the config a fake fallback version.
+      - ./extension/package.json:/extension/package.json:ro
     ports:
       - "5173:5173"
     depends_on:

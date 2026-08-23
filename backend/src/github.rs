@@ -116,8 +116,12 @@ pub struct GitHubClient {
 
 #[derive(Debug, Deserialize)]
 struct RepoResponse {
-    /// Absent for a repository with no commits, so a missing field must not fail
-    /// the whole deserialization.
+    /// Defensive only. GitHub's `full-repository` schema makes this required and
+    /// it is present even for a repository with no commits — an empty repo
+    /// reports the branch the setting names, which is why the commits endpoint's
+    /// 409 is what identifies that state and not a missing field here. Kept so a
+    /// schema change cannot fail the whole deserialization; the empty string is
+    /// then filtered out at the one call site.
     #[serde(default)]
     default_branch: String,
     html_url: String,
@@ -135,17 +139,27 @@ struct CommitResponse {
 struct GitLabProjectResponse {
     id: u64,
     path_with_namespace: String,
-    /// `null` on a project with no commits. As a bare `String` that `null`
-    /// failed the whole response, so an empty GitLab project surfaced as an
-    /// unreadable upstream body instead of `empty_repository`.
+    /// Missing whenever the caller cannot read the code: GitLab exposes
+    /// `default_branch` (alongside the clone URLs) only to callers holding
+    /// `read_code`, which a *public* project denies when its repository feature
+    /// is member-only or disabled. A project with no commits is a different
+    /// state and says so with `empty_repo`, so this being absent is not
+    /// evidence of emptiness — see the one call site, which answers
+    /// "not readable" rather than "empty". `Option` also keeps a schema change
+    /// on a field this resolver barely needs from failing the whole response.
     #[serde(default)]
     default_branch: Option<String>,
     web_url: String,
     visibility: String,
     #[serde(default)]
     star_count: Option<u64>,
-    /// GitLab states emptiness directly; the GitHub path has to infer the same
-    /// condition from a missing default branch.
+    /// GitLab states emptiness outright, where the GitHub path has to read it
+    /// off a 409 from the commits endpoint. Defaulting to `false` fails towards
+    /// "has commits", which is the safe direction: the worst outcome is a ref
+    /// lookup that fails on its own terms. If GitLab gates this on `read_code`
+    /// as well, an empty *and* unreadable project falls through to the
+    /// not-readable answer below — indistinguishable from here, and no more
+    /// wrong than the alternative.
     #[serde(default)]
     empty_repo: bool,
 }
@@ -277,6 +291,19 @@ fn interpret_graphql(response: GraphQlResponse, requested_ref: Option<&str>) -> 
     match requested_ref {
         Some(ref_name) => {
             let Some(object) = repository.object else {
+                // No default branch and nothing resolved means the repository
+                // has no commits, so the ref was never the problem. REST reaches
+                // this from a 409 on the commits endpoint; without this arm the
+                // two paths returned different error bodies for the same
+                // request, which the parity invariant forbids.
+                //
+                // A repository whose HEAD points at a deleted branch while other
+                // branches still have commits would be misreported here, but
+                // GitHub does not produce that state on its own and the previous
+                // answer for it — a bare `ref_not_found` — was no better.
+                if default_branch.is_none() {
+                    return GraphQlOutcome::Failed(GraphQlFailure::EmptyRepository);
+                }
                 return GraphQlOutcome::Failed(GraphQlFailure::RefNotFound { default_branch });
             };
             // GitHub resolves annotated tags to their commit, so anything else
@@ -293,8 +320,9 @@ fn interpret_graphql(response: GraphQlResponse, requested_ref: Option<&str>) -> 
         }
         None => {
             // An empty repository has no default branch. REST reaches the same
-            // conclusion from a 404 on the commits endpoint; both now report it
-            // as `EmptyRepository` rather than blaming a ref the caller never
+            // conclusion from the commits endpoint — a 409 for the repository,
+            // or a 404 on the branch `/repos` named — and both now report it as
+            // `EmptyRepository` rather than blaming a ref the caller never
             // supplied.
             let Some(target) = repository
                 .default_branch_ref
@@ -964,7 +992,15 @@ impl GitHubClient {
             // Nothing to analyse and nothing to suggest. Mirrors the GitHub
             // path, which reaches the same conclusion without `empty_repo`.
             None if project_body.empty_repo => return Err(GitHubError::EmptyRepository),
-            None => default_branch.clone().ok_or(GitHubError::EmptyRepository)?,
+            // No branch to fall back to on a project that claims to have
+            // commits: GitLab withheld the field because we lack `read_code`,
+            // so the archive endpoint would refuse us too. `empty_repository`
+            // used to be the answer here, which told the user their repository
+            // has no commits — confidently false about a repository whose code
+            // is merely hidden. Only this arm checks it: a caller that named
+            // its own ref needs no default branch, and a schema change that
+            // drops the field must not be able to reject that request.
+            None => default_branch.clone().ok_or(GitHubError::PrivateRepo)?,
         };
         let commit_sha = match self.resolve_gitlab_commit(project_body.id, &ref_name).await {
             Ok(sha) => sha,
@@ -1022,6 +1058,13 @@ impl GitHubClient {
             StatusCode::NOT_FOUND => Err(GitHubError::RefNotFound {
                 default_branch: None,
             }),
+            // "Git Repository is empty." GitHub answers this endpoint with a 409
+            // for a repository with no commits, whatever ref was asked for. It
+            // used to fall into the catch-all below and be reported as a missing
+            // ref alongside the default branch from `/repos` — a branch that has
+            // no commits either. GraphQL calls the same state `EmptyRepository`,
+            // and the two paths have to agree.
+            StatusCode::CONFLICT => Err(GitHubError::EmptyRepository),
             status if status.is_server_error() => Err(GitHubError::UpstreamUnavailable),
             _ => Err(GitHubError::RefNotFound {
                 default_branch: None,
@@ -1480,10 +1523,13 @@ mod tests {
         );
     }
 
-    /// An unresolvable ref in a repository with no default branch has nothing to
-    /// suggest, and must not claim one.
+    /// A requested ref that resolves to nothing in a repository that also has no
+    /// default branch is the empty-repository case, not a missing ref: there is
+    /// no ref the caller could have asked for instead. This used to answer
+    /// `ref_not_found` with no branch to suggest, which REST — reading a 409
+    /// off the commits endpoint — contradicted for the same request.
     #[test]
-    fn graphql_omits_the_default_branch_when_there_is_none() {
+    fn graphql_reports_an_empty_repository_even_when_a_ref_was_requested() {
         let outcome = interpret(
             r#"{"data":{"repository":{
                 "isPrivate":false,
@@ -1495,9 +1541,7 @@ mod tests {
         );
         assert_eq!(
             outcome,
-            GraphQlOutcome::Failed(GraphQlFailure::RefNotFound {
-                default_branch: None,
-            })
+            GraphQlOutcome::Failed(GraphQlFailure::EmptyRepository)
         );
     }
 
@@ -1760,11 +1804,14 @@ mod tests {
         );
     }
 
-    /// GitLab reports `"default_branch": null` for a project with no commits.
-    /// As a bare `String` that failed deserialization, so the caller saw an
-    /// unreadable-body error instead of `empty_repository`.
+    /// Two distinct GitLab shapes used to fail the whole response on a bare
+    /// `String` default branch, surfacing as an unreadable upstream body: a
+    /// project with no commits, and a public project whose repository is
+    /// member-only or disabled, where the field is withheld entirely because
+    /// the caller lacks `read_code`. Only the first of those is empty, which is
+    /// what `empty_repo` is read for.
     #[test]
-    fn deserializes_a_gitlab_project_with_no_default_branch() {
+    fn deserializes_a_gitlab_project_without_a_default_branch() {
         let body: GitLabProjectResponse = serde_json::from_str(
             r#"{
                 "id": 42,
@@ -1778,6 +1825,22 @@ mod tests {
         .expect("a null default_branch must not fail the whole response");
         assert_eq!(body.default_branch, None);
         assert!(body.empty_repo);
+
+        // Repository feature member-only or disabled: the field is missing
+        // rather than null, and the project is not empty. The resolver has to
+        // tell this apart from the case above — it answers `private_repo`, not
+        // `empty_repository`.
+        let body: GitLabProjectResponse = serde_json::from_str(
+            r#"{
+                "id": 44,
+                "path_with_namespace": "group/issues-only",
+                "web_url": "https://gitlab.com/group/issues-only",
+                "visibility": "public"
+            }"#,
+        )
+        .expect("a withheld default_branch must not fail the whole response");
+        assert_eq!(body.default_branch, None);
+        assert!(!body.empty_repo);
 
         // A populated project still deserializes, and `empty_repo` is absent
         // from older API responses.

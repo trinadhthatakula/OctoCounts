@@ -1,0 +1,44 @@
+# Version updates for one ecosystem only: the actions this repository runs.
+#
+# All 26 `uses:` refs across .github/workflows are floating major tags, so an
+# action that goes stale is invisible until it breaks — and the store-publish
+# path in extension-release.yml only runs on `extension-v*` tags, which is the
+# worst possible moment to discover it. Monthly, grouped into one pull request,
+# is enough to keep them honest without becoming background noise.
+#
+# cargo and npm version updates are deliberately NOT configured here, and not
+# because they are unimportant:
+#
+#   backend/ — a tokei bump has a failure mode nothing in this repository can
+#     catch. `TOKEI_VERSION` in analyzer.rs is folded into a report's identity
+#     key, so bumping the dependency without bumping that constant serves stale
+#     line counts under a key asserting they are fresh (CLAUDE.md states the
+#     invariant). A dependency bot cannot know to edit that constant, and the
+#     drift is a hash, so it is not visible in review either. Any cargo bump
+#     touching tokei needs a human to check analyzer.rs in the same change.
+#
+#   frontend/ and extension/ — their trees are small and their builds are
+#     verified by the Tests workflow, but they carry pre-existing advisories
+#     that a version-update stream would churn against rather than resolve.
+#
+# Vulnerabilities in those ecosystems are covered without this file: Dependabot
+# alerts and Dependabot security updates are repository settings, not
+# configuration, and they raise a pull request only when there is an actual
+# advisory. This file is for staleness, which is a different problem.
+#
+# Note that the github-actions entry means Dependabot edits files under
+# .github/workflows, which requires the `workflow` permission on whatever token
+# reviews or merges its pull requests.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns:
+          - '*'
+    commit-message:
+      prefix: ci

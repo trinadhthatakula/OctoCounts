@@ -16,11 +16,13 @@ name: Tests
 #
 #   frontend/qa/visual-qa.spec.ts — nine Playwright tests needing a ~94 MiB
 #     browser download and a hand-started dev server (playwright.config.ts has
-#     no `webServer` block), leaning on ten fixed waitForTimeout() sleeps, and
-#     including one that fails today for a pre-existing reason: the lazily
-#     loaded zh bundle lands after react-i18next has already re-rendered, so
-#     the language switcher leaves the page in English. A check that is red on
-#     arrival teaches people to ignore checks.
+#     no `webServer` block), leaning on ten fixed waitForTimeout() sleeps. All
+#     nine pass. The ninth used to fail, and this comment used to write that off
+#     as a pre-existing quirk of the lazily loaded zh bundle: it was a real bug
+#     that shipped to production, the language switcher leaving the whole page
+#     in English until a reload. Whoever wires this suite up will find real
+#     defects, and the download plus the dev server is the only thing in the
+#     way — the argument here is cost, and it was never that the test was wrong.
 #
 #   extension/tests/smoke/ — drives real github.com through a headed Chromium.
 #     Already covered by extension-dom-monitor.yml, which exists precisely so
@@ -231,7 +233,7 @@ jobs:
             >> "$GITHUB_STEP_SUMMARY"
 
   frontend:
-    name: frontend · tsc, vite build, 30 SEO tests
+    name: frontend · tsc, vite build, 4 unit + 30 SEO tests
     runs-on: ubuntu-latest
     timeout-minutes: 15
     defaults:
@@ -250,14 +252,16 @@ jobs:
       # lockfile, so a green install here is also the lockfile-sync check.
       - run: npm ci
 
-      # test:seo is prebuild (copy the JetBrains Mono subset out of
-      # node_modules) → tsc → vite build → node --test tests/seo.test.mjs, so
-      # this one step is the type check as well. The build is not optional: the
-      # suite asserts on dist/index.html *and* on functions/[[path]].js, the
-      # two places page metadata is injected and which have to agree or a
-      # hydration flip turns an indexable page into a noindex one. Every fetch
-      # in the suite is stubbed; nothing here reaches the network.
-      - run: npm run test:seo
+      # `npm test` is test:unit (no build needed) → test:seo, which is prebuild
+      # (copy the JetBrains Mono subset out of node_modules) → tsc → vite build
+      # → node --test tests/seo.test.mjs, so this one step is the type check as
+      # well. The build is not optional: that suite asserts on dist/index.html
+      # *and* on functions/[[path]].js, the two places page metadata is
+      # injected and which have to agree or a hydration flip turns an indexable
+      # page into a noindex one. Every fetch in both suites is stubbed; nothing
+      # here reaches the network, including the githubstatus.com payload that
+      # github-status.test.mjs asserts against as a literal.
+      - run: npm test
 
   extension:
     name: extension · 33 DOM tests, 3 builds, 8 artifact tests

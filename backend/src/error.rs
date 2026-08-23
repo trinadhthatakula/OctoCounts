@@ -22,9 +22,17 @@ impl ApiError {
             body: ApiErrorBody {
                 code: code.to_string(),
                 message: message.into(),
+                default_branch: None,
             },
             retry_after: None,
         }
+    }
+
+    /// Attaches the repository's default branch to the body so clients that
+    /// localize by `code` can still name it.
+    fn with_default_branch(mut self, branch: Option<String>) -> Self {
+        self.body.default_branch = branch;
+        self
     }
 
     fn with_retry_after(mut self, seconds: u64) -> Self {
@@ -73,8 +81,22 @@ impl From<GitHubError> for ApiError {
             GitHubError::PrivateRepo => {
                 Self::new(StatusCode::FORBIDDEN, "private_repo", error.to_string())
             }
-            GitHubError::RefNotFound => {
-                Self::new(StatusCode::NOT_FOUND, "ref_not_found", error.to_string())
+            // The code stays `ref_not_found` — clients switch on it — but the
+            // message names the branch that does exist. Without it a
+            // `main`-vs-`master` mismatch looks like a broken repository rather
+            // than a wrong ref, and the caller has no way to find the right one.
+            GitHubError::RefNotFound { ref default_branch } => {
+                let message = match default_branch {
+                    Some(branch) => format!(
+                        "requested ref was not found; this repository's default branch is \"{branch}\""
+                    ),
+                    None => error.to_string(),
+                };
+                Self::new(StatusCode::NOT_FOUND, "ref_not_found", message)
+                    .with_default_branch(default_branch.clone())
+            }
+            GitHubError::EmptyRepository => {
+                Self::new(StatusCode::NOT_FOUND, "empty_repository", error.to_string())
             }
             GitHubError::RateLimited => Self::new(
                 StatusCode::TOO_MANY_REQUESTS,
@@ -139,6 +161,55 @@ mod tests {
         )
         .unwrap();
         assert_eq!(body.code, "github_unavailable");
+    }
+
+    async fn error_body(error: GitHubError) -> ApiErrorBody {
+        let response = ApiError::from(error).into_response();
+        serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 4096).await.unwrap())
+            .unwrap()
+    }
+
+    /// The whole point of the `main`-vs-`master` fix on the reporting side: the
+    /// code stays stable for clients that switch on it, the message says which
+    /// branch exists, and the branch also travels as data for clients that
+    /// replace the message with a localized one.
+    #[tokio::test]
+    async fn ref_not_found_names_the_repositorys_default_branch() {
+        let body = error_body(GitHubError::RefNotFound {
+            default_branch: Some("master".to_string()),
+        })
+        .await;
+        assert_eq!(body.code, "ref_not_found");
+        assert_eq!(body.default_branch.as_deref(), Some("master"));
+        assert!(body.message.contains("master"), "message was {}", body.message);
+    }
+
+    /// Nothing to suggest, nothing claimed — and no `defaultBranch` key at all,
+    /// so a client cannot mistake absence for an empty branch name.
+    #[tokio::test]
+    async fn ref_not_found_without_a_known_default_branch_stays_generic() {
+        let error = ApiError::from(GitHubError::RefNotFound {
+            default_branch: None,
+        });
+        assert_eq!(
+            serde_json::to_value(error.body()).unwrap(),
+            serde_json::json!({
+                "code": "ref_not_found",
+                "message": "requested ref was not found",
+            })
+        );
+    }
+
+    /// An empty repository is not a missing ref: the caller supplied none.
+    #[tokio::test]
+    async fn empty_repository_gets_its_own_code() {
+        let response = ApiError::from(GitHubError::EmptyRepository).into_response();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: ApiErrorBody = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), 4096).await.unwrap(),
+        )
+        .unwrap();
+        assert_eq!(body.code, "empty_repository");
     }
 
     #[tokio::test]

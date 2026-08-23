@@ -135,11 +135,19 @@ struct CommitResponse {
 struct GitLabProjectResponse {
     id: u64,
     path_with_namespace: String,
-    default_branch: String,
+    /// `null` on a project with no commits. As a bare `String` that `null`
+    /// failed the whole response, so an empty GitLab project surfaced as an
+    /// unreadable upstream body instead of `empty_repository`.
+    #[serde(default)]
+    default_branch: Option<String>,
     web_url: String,
     visibility: String,
     #[serde(default)]
     star_count: Option<u64>,
+    /// GitLab states emptiness directly; the GitHub path has to infer the same
+    /// condition from a missing default branch.
+    #[serde(default)]
+    empty_repo: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -385,8 +393,20 @@ fn ref_candidates_from_path(rest: &[String]) -> Vec<String> {
     if rest.is_empty() {
         return Vec::new();
     }
-    let whole = rest.join("/");
-    let first = rest[0].clone();
+    // `Url::path_segments` yields percent-encoded segments, but a ref name
+    // travels onward as data that `resolve_commit` encodes again. Leaving the
+    // escapes in place turned `release%2020.1` into `release%252020.1`, which
+    // GitHub answers with a 404. A bare `%` is not an error here: `100%` is a
+    // legal branch name, so a segment that does not decode is kept verbatim.
+    let decoded: Vec<String> = rest
+        .iter()
+        .map(|part| match urlencoding::decode(part) {
+            Ok(value) => value.into_owned(),
+            Err(_) => part.clone(),
+        })
+        .collect();
+    let whole = decoded.join("/");
+    let first = decoded[0].clone();
     if first == whole {
         vec![whole]
     } else {
@@ -933,21 +953,33 @@ impl GitHubClient {
             return Err(GitHubError::PrivateRepo);
         }
 
-        let ref_name = requested_ref
-            .filter(|value| !value.trim().is_empty())
-            .unwrap_or_else(|| project_body.default_branch.clone());
-        let commit_sha = self
-            .resolve_gitlab_commit(project_body.id, &ref_name)
-            .await
-            .map_err(|error| match error {
-                // Same reason as the GitHub path: the project request already
-                // told us the default branch, so the 404 can name it.
-                GitHubError::RefNotFound { .. } => GitHubError::RefNotFound {
-                    default_branch: Some(project_body.default_branch.clone())
-                        .filter(|name| !name.is_empty()),
-                },
-                other => other,
-            })?;
+        let requested_ref = requested_ref.filter(|value| !value.trim().is_empty());
+        let used_default = requested_ref.is_none();
+        let default_branch = project_body
+            .default_branch
+            .clone()
+            .filter(|name| !name.trim().is_empty());
+        let ref_name = match requested_ref {
+            Some(value) => value,
+            // Nothing to analyse and nothing to suggest. Mirrors the GitHub
+            // path, which reaches the same conclusion without `empty_repo`.
+            None if project_body.empty_repo => return Err(GitHubError::EmptyRepository),
+            None => default_branch.clone().ok_or(GitHubError::EmptyRepository)?,
+        };
+        let commit_sha = match self.resolve_gitlab_commit(project_body.id, &ref_name).await {
+            Ok(sha) => sha,
+            // The default branch itself has no commits, so the ref was never
+            // the problem.
+            Err(GitHubError::RefNotFound { .. }) if used_default => {
+                return Err(GitHubError::EmptyRepository)
+            }
+            // Same reason as the GitHub path: the project request already told
+            // us the default branch, so the 404 can name it.
+            Err(GitHubError::RefNotFound { .. }) => {
+                return Err(GitHubError::RefNotFound { default_branch })
+            }
+            Err(other) => return Err(other),
+        };
         let owner = project_body
             .path_with_namespace
             .rsplit_once('/')
@@ -1107,8 +1139,8 @@ impl GitHubClient {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_ref_cache, interpret_graphql, GitHubClient, GitHubError, GraphQlFailure,
-        GraphQlOutcome, RepoRef, RepositoryProvider, REF_CACHE_TTL,
+        build_ref_cache, interpret_graphql, GitHubClient, GitHubError, GitLabProjectResponse,
+        GraphQlFailure, GraphQlOutcome, RepoRef, RepositoryProvider, REF_CACHE_TTL,
     };
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
@@ -1702,5 +1734,64 @@ mod tests {
         // GitLab refs sit behind `/-/`, which this parser folds into the project
         // path; guessing a ref out of it would be worse than not trying.
         assert!(ref_candidates("https://gitlab.com/group/sub/project").is_empty());
+    }
+
+    /// A ref reaches GitHub as data and gets encoded on the way out, so the
+    /// escapes a browser put in the URL have to come off here. Left on,
+    /// `release%2020.1` went out as `release%252020.1` and 404ed.
+    #[test]
+    fn decodes_percent_escapes_in_a_browse_ref() {
+        assert_eq!(
+            ref_candidates("https://github.com/acme/app/tree/release%2020.1"),
+            vec!["release 20.1".to_string()]
+        );
+        // An encoded separator stays one path segment, so unlike a literal `/`
+        // it is not ambiguous: the slash is part of the branch name and there is
+        // only one reading to offer.
+        assert_eq!(
+            ref_candidates("https://github.com/acme/app/tree/release%2F1.x"),
+            vec!["release/1.x".to_string()]
+        );
+        // `%` on its own is not an escape sequence, and `100%` is a legal branch
+        // name: keep it rather than dropping the ref.
+        assert_eq!(
+            ref_candidates("https://github.com/acme/app/tree/100%"),
+            vec!["100%".to_string()]
+        );
+    }
+
+    /// GitLab reports `"default_branch": null` for a project with no commits.
+    /// As a bare `String` that failed deserialization, so the caller saw an
+    /// unreadable-body error instead of `empty_repository`.
+    #[test]
+    fn deserializes_a_gitlab_project_with_no_default_branch() {
+        let body: GitLabProjectResponse = serde_json::from_str(
+            r#"{
+                "id": 42,
+                "path_with_namespace": "group/empty",
+                "default_branch": null,
+                "web_url": "https://gitlab.com/group/empty",
+                "visibility": "public",
+                "empty_repo": true
+            }"#,
+        )
+        .expect("a null default_branch must not fail the whole response");
+        assert_eq!(body.default_branch, None);
+        assert!(body.empty_repo);
+
+        // A populated project still deserializes, and `empty_repo` is absent
+        // from older API responses.
+        let body: GitLabProjectResponse = serde_json::from_str(
+            r#"{
+                "id": 43,
+                "path_with_namespace": "group/app",
+                "default_branch": "master",
+                "web_url": "https://gitlab.com/group/app",
+                "visibility": "public"
+            }"#,
+        )
+        .expect("a populated project must still deserialize");
+        assert_eq!(body.default_branch.as_deref(), Some("master"));
+        assert!(!body.empty_repo);
     }
 }

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 import test from "node:test";
-import { transform } from "esbuild";
+import ts from "typescript";
 
 import { onRequest } from "../functions/[[path]].js";
 import { COMPARE_REGISTRY } from "../functions/compare-registry.js";
@@ -159,9 +159,18 @@ test("responsive navigation and the two-mode theme control avoid orphaned UI", a
 });
 
 test("matrix language colors meet the non-text contrast threshold", async () => {
+  // Transpiled with `typescript`, which package.json declares, rather than with
+  // esbuild, which it never did: esbuild only ever arrived here as a transitive
+  // dependency of Vite, so bumping Vite to 8 — Rolldown and Oxc, no esbuild
+  // anywhere in the tree — deleted this import out from under the test and
+  // turned main red. tsc is the one transpiler this package is guaranteed to
+  // have, since `npm run build` is literally `tsc && vite build`, so this stays
+  // standing through whatever the bundler does next.
   const source = await readFile(new URL("src/colorContrast.ts", ROOT), "utf8");
-  const compiled = await transform(source, { loader: "ts", format: "esm", target: "es2020" });
-  const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.code).toString("base64")}`;
+  const compiled = ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.ESNext, target: ts.ScriptTarget.ES2020 },
+  });
+  const moduleUrl = `data:text/javascript;base64,${Buffer.from(compiled.outputText).toString("base64")}`;
   const { contrastRatio, MIN_GRAPHIC_CONTRAST, parseHexColor, visibleLanguageColor } = await import(moduleUrl);
   const matrixSurface = [20, 27, 23];
 

@@ -407,10 +407,23 @@ mod tests {
     use super::*;
     use crate::models::JobStatus;
 
-    /// Comfortably under the old 500ms polling floor, and an order of magnitude
-    /// under [`JOB_POLL_INTERVAL`]: a waiter that returns this fast can only have
-    /// been woken by an event or by its own immediate first read.
-    const WOKEN_PROMPTLY: Duration = Duration::from_millis(300);
+    /// Half of [`JOB_POLL_INTERVAL`]: a waiter that returns this fast can only
+    /// have been woken by an event or by its own immediate first read, because
+    /// the poll fallback cannot fire before the full interval has elapsed. That
+    /// gap is the whole assertion, so the margin below 2s is what must be
+    /// preserved — not the specific number.
+    ///
+    /// It was 300ms, which was tight enough to fail on GitHub's 2-vCPU runners
+    /// the first week they ran this suite: two jobs came in at 431ms and 432ms,
+    /// woken by the event and nowhere near the 2s a poll would have taken. The
+    /// window being measured contains a scheduled 20ms sleep and two round trips
+    /// to a Postgres that ~60 other tests are hammering across their own schemas
+    /// at the same time, so it is bounded by scheduling noise, not by wakeup
+    /// latency. Do not tighten this back towards the observed value to make the
+    /// test sharper: it cannot get sharper than the poll interval it is
+    /// distinguishing against, and every ms below ~1s buys flakes rather than
+    /// coverage.
+    const WOKEN_PROMPTLY: Duration = Duration::from_millis(1_000);
 
     struct Harness {
         coordinator: AnalysisCoordinator,

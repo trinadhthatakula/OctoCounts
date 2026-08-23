@@ -1309,9 +1309,27 @@ function refFromRepoUrl(value: string) {
     if (url.hostname !== "github.com") return "";
     const segments = url.pathname.split("/").filter(Boolean);
     if (segments.length !== 4 || !githubRefMarkers.has(segments[2])) return "";
-    return segments[3];
+    return decodeRefSegment(segments[3]);
   } catch {
     return "";
+  }
+}
+
+/**
+ * `url.pathname` is percent-encoded, but the ref goes to the API as data and is
+ * re-encoded by `encodeRefPath` on the way into links. Decoded here it matches
+ * what `parsePublicReportPath` produces from the same ref; left encoded it
+ * became the ref name `release%2020.1` and double-encoded from there.
+ *
+ * A bare `%` throws and is not an error: `100%` is a legal branch name, so an
+ * undecodable segment is kept rather than silently falling back to the default
+ * branch.
+ */
+function decodeRefSegment(segment: string) {
+  try {
+    return decodeURIComponent(segment);
+  } catch {
+    return segment;
   }
 }
 

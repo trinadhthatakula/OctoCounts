@@ -1,14 +1,13 @@
-# GitHub Trending daily snapshot generated 2026-11-13T09:27:54.285Z
+# GitHub Trending daily snapshot generated 2026-11-14T08:55:41.894Z
+alibaba/open-code-review
 GoogleChrome/modern-web-guidance-src
 openai/codex-security
-nvm-sh/nvm
-pookjw/HermesEnabler
+ZhuLinsen/daily_stock_analysis
 we-promise/sure
-QwenLM/qwen-code
-ashhart/TensorFold
-nodejs/node
-addyosmani/agent-skills
-meta/astryx
-CopilotKit/OpenBot
-Alishahryar1/free-claude-code
-ggml-org/llama.cpp
+backnotprop/plannotator
+louislam/uptime-kuma
+block/buzz
+tradermonty/claude-trading-skills
+tailscale/tailcat
+Likely7/Veyra-NRVideo
+ChromeDevTools/chrome-devtools-mcp

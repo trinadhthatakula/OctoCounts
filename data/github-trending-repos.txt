@@ -1,4 +1,4 @@
-# GitHub Trending daily snapshot generated 2026-11-22T09:42:29.101Z
+# GitHub Trending daily snapshot generated 2026-11-23T10:41:49.472Z
 elementalsouls/Claude-BugHunter
 obra/superpowers
 HKUDS/CLI-Anything
